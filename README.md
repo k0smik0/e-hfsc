@@ -7,3 +7,6 @@ It uses hfsc classificator, tc (of course), ifb interfaces, iptables (with connm
   
   
 A little howto is in file header.
+
+--
+You can test your classes and filter using polltc, from [https://github.com/k0smik0/polltc](https://github.com/k0smik0/polltc)
