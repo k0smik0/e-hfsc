@@ -1,0 +1,585 @@
+#!/bin/bash
+# encoding: UTF-8
+#
+# HFSC enhanced script for gain voip, interactive and http traffic, allowing also p2p
+#
+# heavily based on Bliziński's hfsc script, from http://automatthias.wordpress.com/
+# 
+# // license
+#   This program is free software: you can redistribute it and/or modify
+#   it under the terms of the GNU General Public License as published by
+#   the Free Software Foundation, version 3 of the License.
+#
+#   This program is distributed in the hope that it will be useful,
+#   but WITHOUT ANY WARRANTY; without even the implied warranty of
+#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#   GNU General Public License for more details.
+#
+#   You should have received a copy of the GNU General Public License
+#   along with this program.  If not, see <http://www.gnu.org/licenses/>.
+# // license
+# 
+# References:
+# http://www.voip-info.org/wiki/view/QoS+Linux+with+HFSC
+# http://www.nslu2-linux.org/wiki/HowTo/EnableTrafficShaping
+# http://www.cs.cmu.edu/~hzhang/HFSC/main.html
+
+# ABOUT:
+# - egress traffic (from internal to external):
+#     1. is handled directly, applying rules on physical interface (eth*)
+#     2. is shaped granularly, using tc classes and filters
+# - ingress traffic:
+#     1. is handled using ifb interface
+#     2. is shaped using tc ingress qdisc (a better classification has to come)
+
+# HOWTO:
+# 1) you have ifb interfaces available in your kernel
+# 2) every section has its relative howto, see each ones
+
+# Specify parameters of your xDSL. Give values slightly lower than the
+# nominal ones. For example, my line is 8000/348, so I specify 8000/320.
+# Uplink and downlink speeds
+DOWNLINK=8000
+UPLINK=320 # not max (348)
+
+# Device that connects you to the Internet
+DEV=eth1
+
+# ifb device used to shape ingress traffic
+IFB=ifb0
+
+# IP addresses of the VoIP phones,
+# if none, set VOIPIPS=""
+VOIP_IPS="192.168.0.200"
+MAX_VOIP_UPLINK=${UPLINK} #max
+
+# PROTO/PORTS SYNTAX - BE CAREFUL
+# proto1,proto2:multiple_ports_comma_separated|port-range:[c/s]
+# where: proto1,proto2: tcp,udp, and c/s is "client/server"
+# i.e. "tcp:24650-24690:c" means "tcp ports from 24650 to 24690 as client"
+#
+#  "c" and "s" are optionals: 
+#  if specified, they are used only, respectively, 
+#  "c" for destination traffic (acting as client), 
+#  "s" for source (acting as server)
+#
+#  so, if you have a server listening on tcp 12345 port, use "tcp:12345:s", 
+#  while if you have a http server, use "tcp:80,443:cs", since your server 
+#  listens on 80 and 443 but your box is also probably a client for external 
+#  http server (hence "c")
+
+# VoIP telephony
+VOIP_PROTOS="sip rtp rtsp"
+#VOIP_PORTS="udp:5060,5061 udp:4000-4099:cs udp:16150-16199:cs" # 10000:11000 5000:5059 8000:8016 5004 1720 1731"
+VOIP_PORTS="udp:5060,5061 udp:4000-4099:cs udp:16384-16482:cs" # 10000:11000 5000:5059 8000:8016 5004 1720 1731"
+
+# Interactive class: ssh, telnet, dns, vnc, openvpn, irc
+INTERACTIVE_PORTS="tcp:22 tcp:23:c udp:53:c tcp:5900,5901 udp:1190 tcp:6667-6670:c"
+
+# WWW, jabber and IRC
+BROWSING_PORTS="tcp:80:c tcp:443:c tcp:8080-8082:c"
+
+# The lowest priority traffic: eDonkey, Bittorrent, etc.
+P2P_PORTS="tcp,udp:24650-24660 tcp,udp:36650-36660 tcp,udp:46650-46660"
+P2P_PROTOS="bittorrent edonkey"
+MAX_P2P_UPLINK=$(( ${UPLINK}/10 ))
+
+MTU=1540 # your line mtu
+
+###
+### no touch below - or be careful with that axe, eugene!
+###
+
+DEBUG=$2
+
+if [ ! -z $DEBUG ] && [ $DEBUG == "demo" ]
+then
+  IPTABLES="echo iptables"
+  TC="echo tc"
+else
+  IPTABLES="iptables"
+  TC="tc"
+fi
+
+SHAPER_EGRESS="SHAPER_EGRESS"
+IPTABLES_EGRESS_CHAIN="POSTROUTING"
+
+SHAPER_INGRESS="SHAPER_INGRESS"
+IPTABLES_INGRESS_CHAIN="PREROUTING"
+
+# Traffic classes:
+CLASS_LOW_LATENCY=2 # 1:2 Low latency (VoIP)
+CLASS_INTERACTIVE=3 # 1:3 Interactive (SSH, DNS, ACK, OPENVPN)
+CLASS_BROWSING=4 # 1:4 Browsing (HTTP, HTTPs)
+CLASS_DEFAULT=5 # 1:5 Default
+CLASS_LOW_PRIORITY=6 # 1:6 Low priority (p2p, pop3, smtp, etc)
+
+########################################################################
+# Configuration ends here
+########################################################################
+
+function set_rules_for_downlink() {
+  #for now, we use ingress
+  local dev=$DEV
+  
+  # Set up ingress qdisc
+  ${TC} qdisc add dev $dev handle ffff: ingress
+  
+  local port
+  local target
+
+  for target in sport dport
+  do
+    # filter everything related to voip
+    for port in 5060 5061 `seq 16384 16390`
+    do
+     ${TC} filter add dev $dev parent ffff: protocol ip prio 10 \
+        u32 match ip src 0.0.0.0/0 \
+        match ip protocol 6 0xff \
+        match ip $target $port 0xffff \
+        police rate $((10*${DOWNLINK}/10))kbit \
+        burst 35k flowid :1
+    done
+  
+    # Filter everything that is coming in too fast
+    # It's mostly HTTP downloads that keep jamming the downlink, so try to restrict
+    # them to 6/10 of the downlink.
+    for port in 80 443;
+    do
+      ${TC} filter add dev $dev parent ffff: protocol ip prio 50 \
+	u32 match ip src 0.0.0.0/0 \
+	match ip protocol 6 0xff \
+	match ip sport $port 0xffff \
+	police rate $((9*${DOWNLINK}/10))kbit \
+	burst 10k drop flowid :1
+
+      ${TC} filter add dev $dev parent ffff: protocol ip prio 50 \
+	u32 match ip src 0.0.0.0/0 \
+	match ip protocol 6 0xff \
+	match ip dport $port 0xffff \
+	police rate $((9*${DOWNLINK}/10))kbit \
+	burst 10k drop flowid :1
+    done
+  done
+  
+  echo "Ingress shaping applied on $DEV."
+}
+
+function set_rules_for_uplink() {
+  set_up_rules_for_interface $DEV $UPLINK $MAX_P2P_UPLINK $SHAPER_EGRESS $IPTABLES_EGRESS_CHAIN
+  echo "Ingress shaping applied on $DEV."
+}
+
+function set_up_rules_for_interface() {
+  local dev=$1
+  local link=$2
+  local max_p2p_link=$3
+  local chain=$4
+  local iptables_chain=$5
+  set_tc_rules_for_interface $dev $link $max_p2p_link
+  set_iptables_rules_for_interface $dev $chain $iptables_chain
+}
+
+function set_tc_rules_for_interface() {
+  local dev=$1      
+  local link=$2
+  local max_p2p_link=$3
+
+  # add HFSC root qdisc
+  ${TC} qdisc add dev $dev root handle 1: hfsc default $CLASS_DEFAULT
+
+  # add main rate limit class
+  ${TC} class add dev $dev parent 1: classid 1:1 hfsc \
+    sc rate ${link}kbit ul rate ${link}kbit
+    
+  # VoIP: guarantee full uplink for 200ms, then 10/10 uplink
+  ${TC} class add dev $dev parent 1:1  classid 1:"$CLASS_LOW_LATENCY" hfsc \
+     sc m1 ${link}kbit d 200ms m2 $((10*$link/10))kbit \
+     ul rate ${link}kbit
+
+  # Interactive traffic: guarantee realtime half uplink for 50ms, then
+  # 4/10 of the uplink
+  ${TC} class add dev $dev parent 1:1  classid 1:"$CLASS_INTERACTIVE" hfsc \
+    rt m1   ${link}kbit d  50ms m2 $((5*$link/10))kbit \
+    ls m1   ${link}kbit d  50ms m2 $((4*$link/10))kbit \
+    ul rate ${link}kbit
+
+  # Browsing: guarantee 7/10 for the first second, then
+  # guarantee 1/10
+  ${TC} class add dev $dev parent 1:1  classid 1:"$CLASS_BROWSING" hfsc \
+    sc m1 $((6*$link/10))kbit d 1s m2 $(($link/10))kbit \
+    ul rate ${link}kbit
+
+  # Default traffic: don't guarantee anything for the first two seconds,
+  # then guarantee 1/20
+  ${TC} class add dev $dev parent 1:1  classid 1:"$CLASS_DEFAULT" hfsc \
+    sc m1         0 d    2s m2 $(($link/20))kbit \
+    ul rate ${link}kbit
+
+  # low priority traffic: don't guarantee anything for the first 10 seconds,
+  # then guarantee 1/30, until it reaches upper limit (uplink/10 as default)
+  ${TC} class add dev $dev parent 1:1  classid 1:"$CLASS_LOW_PRIORITY" hfsc \
+    ls m1   0 d  10s m2 $(($link/30))kbit \
+    ul rate ${max_p2p_link}kbit
+#    rt m1   0 d  0ms m2 $((1*$link/20))kbit \
+#    ls m1   0 d  10s m2 $((1*$link/30))kbit \
+ 
+
+  local class
+  for class in $CLASS_LOW_LATENCY $CLASS_INTERACTIVE $CLASS_BROWSING $CLASS_DEFAULT $CLASS_LOW_PRIORITY
+  do
+    ${TC} filter add dev $dev parent 1: prio $class protocol ip handle $class fw flowid 1:$class
+  done
+  
+  for class in $CLASS_LOW_LATENCY $CLASS_INTERACTIVE $CLASS_BROWSING $CLASS_DEFAULT $CLASS_LOW_PRIORITY
+  do
+    ${TC} qdisc add dev $dev parent 1:$class handle $class sfq quantum $MTU perturb 10
+  done
+}
+
+function set_iptables_rules_for_interface() {
+  local dev=$1;
+  
+  local chain=$2
+  local chain_pre="${chain}_PRE"
+  
+  local iptables_chain=$3
+  local iptables_chain_pre="${iptables_chain}_PRE"
+     
+  # add $SHAPER chain to mangle $iptables_chain table
+  ${IPTABLES} -t mangle -N $chain
+  ${IPTABLES} -t mangle -I $iptables_chain -o $dev  -j $chain
+
+  ${IPTABLES} -t mangle -N $chain_pre
+  ${IPTABLES} -t mangle -I $iptables_chain -o $dev -j $chain_pre
+  #Restore any previous connection marks
+  ${IPTABLES} -t mangle -A $chain_pre -j CONNMARK --restore-mark
+  #Do not remark any packets--Accept any packets already marked
+  ${IPTABLES} -t mangle -A $chain_pre -m mark ! --mark 0 -j ACCEPT
+  
+  local -a args;
+  local ports_prefs;
+
+  ## FIRST RULES FOR VOIP ##
+  
+  # first rules by ips
+  local voip_ip;  
+  for voip_ip in ${VOIP_IPS}
+  do
+    local -a voip_ips_targets
+    if [[ $chain =~ .*EGRESS.* ]]
+    then
+      voip_ips_targets[0]="--src ${voip_ip} -p udp"
+    elif [[ $chain =~ .*INGRESS.* ]]
+    then
+      voip_ips_targets[1]="--dst ${voip_ip} -p udp"
+    fi
+    local voip_ips_rule;
+    for voip_ips_rule in "${voip_ips_targets[@]}"
+    do
+      args=("${voip_ips_rule}" "${CLASS_LOW_LATENCY}" "${chain}")
+      apply_chain_rules args[@]
+    done
+  done
+  
+  # then rules by ports
+  #local voip_port;
+#  for ports_prefs in $VOIP_PORTS; do set_class_by_port $ports_prefs $CLASS_LOW_LATENCY $chain; done
+  set_class_by_ports_prefs "${VOIP_PORTS}" $CLASS_LOW_LATENCY $chain
+
+  # final rules by l7-proto
+  local l7_proto_args=("${VOIP_PROTOS}" "${CLASS_LOW_LATENCY}" "$chain")
+  apply_class_by_l7_protos l7_proto_args[@]
+  #  local voip_proto;
+#  for voip_proto in ${VOIP_PROTOS}
+#  do
+#    local layer7_voip_rule="-m layer7 --l7proto ${voip_proto}"
+#    args=("${layer7_voip_rule}" "$CLASS_LOW_LATENCY" "$chain")
+#    apply_chain_rules args[@]
+#  done
+#  $IPTABLES 
+
+#  iptables -t mangle -A SHAPER_EGRESS_PRE -p tcp -m osf -m multiport --dports 22,80,443,5900 --genre Windows8 -j MARK --set-xmark 6
+#  iptables -t mangle -A SHAPER_EGRESS_PRE -p udp -m osf -m multiport --dports 53,1190,5060 --genre Windows8 -j MARK --set-xmark 6
+  
+  ## SECOND RULES FOR INTERACTIVE TRAFFIC ## 
+  
+  # ICMP (ip protocol 1) in the interactive class  
+  local icmp_rule="-p icmp -m length --length :512"
+  args=("${icmp_rule}" "$CLASS_INTERACTIVE" "$chain")
+  apply_chain_rules args[@]
+  
+  # syn to 22 in interactive or browsing class 
+  local short_ack_rule="-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN --dport 22"
+  args=("${short_ack_rule}" "$CLASS_INTERACTIVE" "${chain}" "tcp");
+  apply_chain_rules args[@]
+  
+  # remaining rules by ports: 22, 53, 1190, etc
+#   for ports_prefs in $INTERACTIVE_PORTS; do set_class_by_port $ports_prefs $CLASS_INTERACTIVE $chain; done
+  set_class_by_ports_prefs "${INTERACTIVE_PORTS}" $CLASS_INTERACTIVE $chain
+
+
+  ## THIRD RULES FOR BROWSING TRAFFIC ##
+
+  # put large (512+) icmp packets in browsing category
+  local large_icmp_rule="-p icmp -m length --length 512:"
+  args=("${large_icmp_rule}" "$CLASS_BROWSING" "$chain")
+  apply_chain_rules args[@]
+  
+  # syn to 80 in interactive or browsing class 
+  local short_ack_rule="-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN --dport 80"
+  args=("${short_ack_rule}" "$CLASS_BROWSING" "${chain}" "tcp");
+  apply_chain_rules args[@]
+        
+  # remaining rules by ports  
+  set_class_by_ports_prefs "${BROWSING_PORTS}" $CLASS_BROWSING $chain
+
+
+  ## FINALLY RULES FOR P2P
+  set_class_by_ports_prefs "$P2P_PORTS" $CLASS_LOW_PRIORITY $chain
+  
+  # final rules by l7-proto
+  local l7_proto_args=("${P2P_PROTOS}" "${CLASS_LOW_PRIORITY}" "$chain")
+  apply_class_by_l7_protos l7_proto_args[@]
+#  local p2p_p;
+#  for p2p_p in ${P2P_PROTOS}
+#  do
+#    local layer_p2p_rule="-m layer7 --l7proto ${p2p_p}"
+#    args=("${layer_p2p_rule}" "$CLASS_LOW_PRIORITY" "$chain")
+#    apply_chain_rules args[@]
+#  done
+ 
+  [ ! -z $DEBUG ] && {
+    echo debug on
+    args=("" $CLASS_DEFAULT $chain)
+  }
+  
+  ${IPTABLES} -t mangle -A $chain_pre -j CONNMARK --save-mark
+  ${IPTABLES} -t mangle -A $chain_pre -j RETURN
+  
+  ${IPTABLES} -t mangle -A $chain -j RETURN
+}
+
+
+
+# usage: apply_chain_rules (rule,class,chain,[proto]) <- array
+function apply_chain_rules() {
+  local args=("${!1}")
+  local rule=${args[0]}
+  local class=${args[1]}
+  local class_mark="${class}"
+  local chain=${args[2]}
+  local chain_pre="${chain}_PRE"
+  local proto=${args[3]}
+  
+   
+  [ $DEBUG ] && echo "rule:${rule} class:${class} chain:$chain chain_pre:$chain_pre proto:$proto"
+  ${IPTABLES} -t mangle -A ${chain_pre} \
+    ${rule} \
+    -j MARK --set-mark ${class_mark}
+  if [ ! -z $DEBUG ] 
+  then
+     ${IPTABLES} -t mangle -A $chain_pre -m mark --mark $class_mark -j LOG --log-prefix "marked with $class_mark -> "
+  fi
+  ${IPTABLES} -t mangle -A $chain \
+    $rule \
+    -j CLASSIFY --set-class 1:"$class"
+}
+
+function set_class_by_ports_prefs() {
+  local ports_prefs=$1
+  local class=$2
+  local chain=$3
+   
+  local pps;
+  local has_range="false"
+  for pps in ${ports_prefs}
+  do
+    local -a prefs_array=(${pps//:/ })
+    local -a protos=(${prefs_array[0]//,/ })
+    local ports=(${prefs_array[1]//-/:})
+    local m_options="";
+    [[ $ports =~ .*,.* ]] && has_range="true"
+    
+    local direction=${prefs_array[2]}
+    
+    local proto
+    local direction_targets
+    local direction_target
+    for proto in "${protos[@]}"
+    do
+      if [[ -z $direction ]] || [[ $direction == "cs" ]]; then
+	if [[ $has_range == "true" ]]; then
+	  m_options="-m multiport"
+	  direction_targets="--sports --dports"
+	else
+	  direction_targets="--sport --dport"
+	fi
+      elif [[ $direction == "s" ]]; then
+	if [[ $has_range == "true" ]]; then
+	  m_options="-m multiport"
+	  direction_targets="--sports"
+	else
+	  direction_targets="--sport"
+	fi
+      elif [[ $direction == "c" ]]; then
+	if [[ $has_range == "true" ]]; then
+	  m_options="-m multiport"
+	  direction_targets="--dports"
+	else
+	  direction_targets="--dport"
+	fi
+      fi
+      
+      for direction_target in $direction_targets
+      do 
+      	local args=($proto "${m_options}" $direction_target $ports $class $chain)
+      	apply_class_by_port_prefs args[@]
+      done
+    done    
+  done
+}
+
+function apply_class_by_port_prefs() {
+  local argv=("${!1}")
+  local proto=${argv[0]}
+  local m_options=${argv[1]}
+  local direction=${argv[2]}
+  local ports=${argv[3]}
+  local class=${argv[4]}
+  local shaper_chain=${argv[5]}
+  local rule="-p $proto ${m_options} ${direction} ${ports}"
+  local args=("${rule}" $class $shaper_chain $proto)
+  apply_chain_rules args[@]  
+} 
+
+function apply_class_by_port_range() {
+  local proto=$1
+  local direction=$2
+  local port_range=$3
+  local class=$4
+  local shaper_chain=$5
+  local rule="-p $proto ${direction} ${port_range}"
+  local args=("${rule}" $class $shaper_chain $proto)
+  apply_chain_rules args[@]
+}
+
+function check_layer7_is_available {
+   find /lib/modules/$(uname -r) -iname *xt_layer7.ko* > /dev/null \
+      && find /lib/xtables/ -iname *libxt_layer7* > /dev/null \
+      && echo 0 \
+      || echo 1
+}
+
+function apply_class_by_l7_protos__real() {
+  local args=("${!1}");
+  local l7_protos=${args[0]}
+  local class_priority=${args[1]};
+  local chain=${args[2]}
+  for proto in ${l7_protos[@]}
+  do
+    local layer7_rule="-m layer7 --l7proto ${proto}"
+    local args=("${layer7_rule}" "$class_priority" "$chain")
+    apply_chain_rules args[@]
+  done  
+}
+function apply_class_by_l7_protos() {
+   local args=("${!1}");
+   [ check_layer7_is_available ] && apply_class_by_l7_protos__real args[@]
+}
+
+function status() {
+  echo ""
+  for device in $DEV $IFB;
+  do
+    if [[ $device =~ "eth" ]]
+    then
+      echo -e "\tUPLOAD\n"
+    else
+      echo -e "\tDOWNLOAD\n"
+    fi
+    
+    echo "[qdisc]"
+    ${TC} -s qdisc show dev $device
+
+    echo ""
+    echo "[class]"
+    ${TC} -s class show dev $device
+
+    echo ""
+    echo "[filter]"
+    ${TC} -s filter show dev $device
+
+    echo ""
+    echo "[iptables]"
+    if [[ $device =~ "eth" ]]
+    then
+      ${IPTABLES} -t mangle -L  $SHAPER_EGRESS -v -n 2> /dev/null
+      ${IPTABLES} -t mangle -L  "${SHAPER_EGRESS}_PRE" -v -n 2> /dev/null
+    else
+      ${IPTABLES} -t mangle -L  $SHAPER_INGRESS -v -n 2> /dev/null
+      ${IPTABLES} -t mangle -L  "${SHAPER_INPUT}_PRE" -v -n 2> /dev/null
+    fi
+    
+    echo ""
+  done
+}
+
+function delete_for_interface() {
+  local dev=$1
+  local chain=$2
+  local x_gress=$3
+  local x_gress_pre="$3_PRE"
+  ${TC} qdisc del dev $dev root  2>/dev/null
+  
+  # Flush and delete tables
+  $IPTABLES -t mangle -D $chain -o $dev -j $x_gress 2>/dev/null
+  ${IPTABLES} -t mangle -F $x_gress   2>/dev/null
+  ${IPTABLES} -t mangle -X $x_gress  2>/dev/null
+  
+  ${IPTABLES} -t mangle -D $chain -o $dev -j "${x_gress_pre}" 2>/dev/null
+  ${IPTABLES} -t mangle -F "${x_gress_pre}" 2>/dev/null
+  ${IPTABLES} -t mangle -X "${x_gress_pre}"  2>/dev/null
+}
+
+function delete_for_uplink() {
+  delete_for_interface $DEV $IPTABLES_EGRESS_CHAIN $SHAPER_EGRESS
+  echo "Egress shaping removed on $DEV."
+}
+
+function delete_for_downlink() {
+  ${TC} qdisc del dev $DEV ingress > /dev/null 2>&1
+  # future:
+  # delete_for_interface $IFB_DEV ;
+  echo "Ingress shaping removed on $DEV."
+}
+
+case "$1" in
+status)
+  status
+  exit
+  ;;
+stop)
+  delete_for_uplink
+  delete_for_downlink
+  exit
+  ;;
+start)
+  set_rules_for_uplink
+  set_rules_for_downlink
+  exit
+  ;;
+restart)
+  delete_for_uplink
+  delete_for_downlink
+
+  set_rules_for_uplink
+  set_rules_for_downlink
+  exit
+  ;;
+*)
+  echo "$(basename $0) start|stop|status|restart"
+  exit
+  ;;
+esac
+
