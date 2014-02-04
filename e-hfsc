@@ -1,7 +1,8 @@
 #!/bin/bash
 # encoding: UTF-8
 #
-# HFSC enhanced script for gain voip, interactive and http traffic, allowing also p2p
+# E-HFSC ("enhanced-hfsc") is a script for make better gain for 
+# voip, interactive and http traffic, allowing even the p2p one
 #
 # heavily based on Bliziński's hfsc script, from http://automatthias.wordpress.com/
 # 
