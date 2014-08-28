@@ -70,16 +70,16 @@ MAX_VOIP_UPLINK=${UPLINK} #max
 # VoIP telephony
 VOIP_PROTOS="sip rtp rtsp"
 #VOIP_PORTS="udp:5060,5061 udp:4000-4099:cs udp:16150-16199:cs" # 10000:11000 5000:5059 8000:8016 5004 1720 1731"
-VOIP_PORTS="udp:5060,5061 udp:4000-4099:cs udp:16384-16482:cs" # 10000:11000 5000:5059 8000:8016 5004 1720 1731"
+VOIP_PORTS="udp:5060,5061 udp:4000-4099:cs udp:16384-16482:cs tcp,udp:19302-19309:cs" # 10000:11000 5000:5059 8000:8016 5004 1720 1731"
 
-# Interactive class: ssh, telnet, dns, vnc, openvpn, irc
-INTERACTIVE_PORTS="tcp:22 tcp:23:c udp:53:c tcp:5900,5901 udp:1190 tcp:6667-6670:c"
+# Interactive class: ssh, telnet,   dns,     vnc,           openvpn,             irc
+INTERACTIVE_PORTS="tcp:22 tcp:23:c udp:53:c tcp:5900,5901,8080 udp:993,1190:cs tcp:6667-6670:c"
 
 # WWW, jabber and IRC
-BROWSING_PORTS="tcp:80:c tcp:443:c tcp:8080-8082:c"
+BROWSING_PORTS="tcp:80:cs tcp:443:cs tcp:8080-8082:cs"
 
 # The lowest priority traffic: eDonkey, Bittorrent, etc.
-P2P_PORTS="tcp,udp:24650-24660 tcp,udp:36650-36660 tcp,udp:46650-46660"
+P2P_PORTS="udp:6771:cs tcp,udp:24650-24672:cs tcp,udp:36650-36660:cs tcp,udp:46650-46660:cs"
 # in the above line we use layer7 filter - be careful it doesn't work if traffic is encrypted
 P2P_PROTOS="bittorrent edonkey"
 MAX_P2P_UPLINK=$(( ${UPLINK}/10 ))
@@ -94,10 +94,10 @@ DEBUG=$2
 
 if [ ! -z $DEBUG ] && [ $DEBUG == "demo" ]
 then
-  IPTABLES="echo iptables"
+  IPTABLES_MANGLE="echo iptables -t mangle"
   TC="echo tc"
 else
-  IPTABLES="iptables"
+  IPTABLES_MANGLE="iptables -t mangle"
   TC="tc"
 fi
 
@@ -150,14 +150,14 @@ function set_rules_for_downlink() {
 	u32 match ip src 0.0.0.0/0 \
 	match ip protocol 6 0xff \
 	match ip sport $port 0xffff \
-	police rate $((9*${DOWNLINK}/10))kbit \
+	police rate $((6*${DOWNLINK}/10))kbit \
 	burst 10k drop flowid :1
 
       ${TC} filter add dev $dev parent ffff: protocol ip prio 50 \
 	u32 match ip src 0.0.0.0/0 \
 	match ip protocol 6 0xff \
 	match ip dport $port 0xffff \
-	police rate $((9*${DOWNLINK}/10))kbit \
+	police rate $((6*${DOWNLINK}/10))kbit \
 	burst 10k drop flowid :1
     done
   done
@@ -247,15 +247,15 @@ function set_iptables_rules_for_interface() {
   local iptables_chain_pre="${iptables_chain}_PRE"
      
   # add $SHAPER chain to mangle $iptables_chain table
-  ${IPTABLES} -t mangle -N $chain
-  ${IPTABLES} -t mangle -I $iptables_chain -o $dev  -j $chain
+  ${IPTABLES_MANGLE} -N ${chain}
+  ${IPTABLES_MANGLE} -I ${iptables_chain} -o $dev -j ${chain}
 
-  ${IPTABLES} -t mangle -N $chain_pre
-  ${IPTABLES} -t mangle -I $iptables_chain -o $dev -j $chain_pre
+  ${IPTABLES_MANGLE} -N ${chain_pre}
+  ${IPTABLES_MANGLE} -I ${iptables_chain} -o $dev -j ${chain_pre}
   #Restore any previous connection marks
-  ${IPTABLES} -t mangle -A $chain_pre -j CONNMARK --restore-mark
+  ${IPTABLES_MANGLE} -A $chain_pre -j CONNMARK --restore-mark
   #Do not remark any packets--Accept any packets already marked
-  ${IPTABLES} -t mangle -A $chain_pre -m mark ! --mark 0 -j ACCEPT
+  ${IPTABLES_MANGLE} -t mangle -A $chain_pre -m mark ! --mark 0 -j ACCEPT
   
   local -a args;
   local ports_prefs;
@@ -339,10 +339,10 @@ function set_iptables_rules_for_interface() {
     args=("" $CLASS_DEFAULT $chain)
   }
   
-  ${IPTABLES} -t mangle -A $chain_pre -j CONNMARK --save-mark
-  ${IPTABLES} -t mangle -A $chain_pre -j RETURN
+  ${IPTABLES_MANGLE} -A $chain_pre -j CONNMARK --save-mark
+  ${IPTABLES_MANGLE} -A $chain_pre -j RETURN
   
-  ${IPTABLES} -t mangle -A $chain -j RETURN
+  ${IPTABLES_MANGLE} -A $chain -j RETURN
 }
 
 
@@ -359,14 +359,14 @@ function apply_chain_rules() {
   
    
   [ $DEBUG ] && echo "rule:${rule} class:${class} chain:$chain chain_pre:$chain_pre proto:$proto"
-  ${IPTABLES} -t mangle -A ${chain_pre} \
+  ${IPTABLES_MANGLE} -A ${chain_pre} \
     ${rule} \
     -j MARK --set-mark ${class_mark}
   if [ ! -z $DEBUG ] 
   then
-     ${IPTABLES} -t mangle -A $chain_pre -m mark --mark $class_mark -j LOG --log-prefix "marked with $class_mark -> "
+     ${IPTABLES_MANGLE} -A $chain_pre -m mark --mark $class_mark -j LOG --log-prefix "marked with $class_mark -> "
   fi
-  ${IPTABLES} -t mangle -A $chain \
+  ${IPTABLES_MANGLE} -A $chain \
     $rule \
     -j CLASSIFY --set-class 1:"$class"
 }
@@ -499,11 +499,11 @@ function status() {
     echo "[iptables]"
     if [[ $device =~ "eth" ]]
     then
-      ${IPTABLES} -t mangle -L  $SHAPER_EGRESS -v -n 2> /dev/null
-      ${IPTABLES} -t mangle -L  "${SHAPER_EGRESS}_PRE" -v -n 2> /dev/null
+      ${IPTABLES_MANGLE} -L  $SHAPER_EGRESS -v -n 2> /dev/null
+      ${IPTABLES_MANGLE} -L  "${SHAPER_EGRESS}_PRE" -v -n 2> /dev/null
     else
-      ${IPTABLES} -t mangle -L  $SHAPER_INGRESS -v -n 2> /dev/null
-      ${IPTABLES} -t mangle -L  "${SHAPER_INPUT}_PRE" -v -n 2> /dev/null
+      ${IPTABLES_MANGLE} -L  $SHAPER_INGRESS -v -n 2> /dev/null
+      ${IPTABLES_MANGLE} -L  "${SHAPER_INPUT}_PRE" -v -n 2> /dev/null
     fi
     
     echo ""
@@ -518,13 +518,14 @@ function delete_for_interface() {
   ${TC} qdisc del dev $dev root  2>/dev/null
   
   # Flush and delete tables
-  $IPTABLES -t mangle -D $chain -o $dev -j $x_gress 2>/dev/null
-  ${IPTABLES} -t mangle -F $x_gress   2>/dev/null
-  ${IPTABLES} -t mangle -X $x_gress  2>/dev/null
+  ${IPTABLES_MANGLE} -D $chain -o $dev -j $x_gress 2>/dev/null
+  ${IPTABLES_MANGLE} -F $x_gress 2>/dev/null
+#  echo removing ${x_gress}
+  ${IPTABLES_MANGLE} -X ${x_gress} 2>/dev/null
   
-  ${IPTABLES} -t mangle -D $chain -o $dev -j "${x_gress_pre}" 2>/dev/null
-  ${IPTABLES} -t mangle -F "${x_gress_pre}" 2>/dev/null
-  ${IPTABLES} -t mangle -X "${x_gress_pre}"  2>/dev/null
+  ${IPTABLES_MANGLE} -D $chain -o $dev -j "${x_gress_pre}" 2>/dev/null
+  ${IPTABLES_MANGLE} -F "${x_gress_pre}" 2>/dev/null
+  ${IPTABLES_MANGLE} -X "${x_gress_pre}" 2>/dev/null
 }
 
 function delete_for_uplink() {
